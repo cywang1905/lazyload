@@ -2,19 +2,17 @@ package controllers
 
 import (
 	"context"
-	"fmt"
-
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"slime.io/slime/framework/model"
+	"slime.io/slime/framework/model/source"
+	"slime.io/slime/framework/model/source/aggregate"
 
-	"k8s.io/apimachinery/pkg/api/errors"
-
-	event_source "slime.io/slime/framework/model/source"
 	lazyloadv1alpha1 "slime.io/slime/modules/lazyload/api/v1alpha1"
 )
 
@@ -27,19 +25,22 @@ const (
 	CreatedByFenceController = "fence-controller"
 )
 
-func (r *ServicefenceReconciler) WatchSource(stop <-chan struct{}) {
+func (r *ServicefenceReconciler) WatchSource(m source.MetricSourceForAggregate) {
 	go func() {
 		for {
 			select {
-			case <-stop:
+			case <-r.env.Stop:
+				log.Debugf("start to stop metric source %s...", m.Name())
+				if err := aggregate.Remove(m); err != nil {
+					log.Errorf("failed to stop metric source %s: %v", m.Name(), err)
+				}
+				log.Infof("succeed to stop metric source %s from aggregate metric source", m.Name())
 				return
 			case e := <-r.eventChan:
-				switch e.EventType {
-				case event_source.Update, event_source.Add:
-					if _, err := r.Refresh(reconcile.Request{NamespacedName: e.Loc}, e.Info); err != nil {
-						fmt.Printf("error:%v", err)
+					log.Debugf("lazyload reconsiler got module event %s", e.NN.String())
+					if _, err := r.Refresh(reconcile.Request{NamespacedName: e.NN}, e.Material); err != nil {
+						log.Errorf("ServicefenceReconciler refresh error:%v", err)
 					}
-				}
 			}
 		}
 	}()

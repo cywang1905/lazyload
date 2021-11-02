@@ -20,13 +20,13 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slime.io/slime/framework/model/module"
+	"slime.io/slime/framework/model/source"
 	"strings"
 	"sync"
 	"time"
 
 	"slime.io/slime/framework/model"
-
-	"slime.io/slime/framework/apis/config/v1alpha1"
 
 	istio "istio.io/api/networking/v1alpha3"
 	corev1 "k8s.io/api/core/v1"
@@ -43,7 +43,6 @@ import (
 	"slime.io/slime/framework/apis/networking/v1alpha3"
 	"slime.io/slime/framework/bootstrap"
 	"slime.io/slime/framework/controllers"
-	event_source "slime.io/slime/framework/model/source"
 	"slime.io/slime/framework/model/source/aggregate"
 	"slime.io/slime/framework/model/source/k8s"
 	"slime.io/slime/framework/util"
@@ -55,41 +54,43 @@ import (
 // ServicefenceReconciler reconciles a Servicefence object
 type ServicefenceReconciler struct {
 	client.Client
-	Scheme            *runtime.Scheme
-	cfg               *v1alpha1.Fence
-	env               *bootstrap.Environment
-	eventChan         chan event_source.Event
-	source            event_source.Source
+	Scheme *runtime.Scheme
+	//cfg               *v1alpha1.Fence
+	env       *bootstrap.Environment
+	eventChan chan model.ModuleEvent
+	//source            event_source.Source
+	source            source.MetricSourceForModule
 	reconcileLock     sync.Mutex
 	staleNamespaces   map[string]bool
 	enabledNamespaces map[string]bool
 }
 
 // NewReconciler returns a new reconcile.Reconciler
-func NewReconciler(cfg *v1alpha1.Fence, mgr manager.Manager, env *bootstrap.Environment) *ServicefenceReconciler {
+func NewReconciler(mo module.Module, mgr manager.Manager) *ServicefenceReconciler {
 	log := modmodel.ModuleLog.WithField(model.LogFieldKeyFunction, "NewReconciler")
 
 	r := &ServicefenceReconciler{
-		Client:            mgr.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		cfg:               cfg,
-		env:               env,
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		//cfg:               cfg,
+		env:               mo.Env(),
 		staleNamespaces:   map[string]bool{},
 		enabledNamespaces: map[string]bool{},
 	}
 
-	if env.Config.Metric != nil {
-		eventChan := make(chan event_source.Event)
-		src := &aggregate.Source{}
-		if ms, err := k8s.NewMetricSource(eventChan, env); err != nil {
-			log.Errorf("failed to create slime-metric, %+v", err)
+	if mo.Env().Config.Metric != nil {
+		if ms, err := k8s.Register(mo); err != nil {
+			log.Errorf("failed to convert module to metric source, %+v", err)
 		} else {
-			src.Sources = append(src.Sources, ms)
-			r.eventChan = eventChan
-			r.source = src
-
-			r.source.Start(env.Stop)
-			r.WatchSource(env.Stop)
+			log.Infof("successfully convert module to metric source")
+			r.source = ms
+			if err := aggregate.Add(ms); err != nil {
+				log.Errorf("failed to add metric source, %+v", err)
+			} else {
+				log.Infof("successfully add metric source")
+				r.eventChan = mo.ModuleEventChan()
+				r.WatchSource(ms)
+			}
 		}
 	}
 	return r
@@ -114,8 +115,9 @@ func (r *ServicefenceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error
 		if errors.IsNotFound(err) {
 			// TODO should be recovered? maybe we should call refreshFenceStatusOfService here
 			log.Info("serviceFence is deleted")
-			r.source.WatchRemove(req.NamespacedName)
-			return reconcile.Result{}, nil
+			//r.source.WatchRemove(req.NamespacedName)
+			r.source.InterestRemove(req.NamespacedName)
+			return r.refreshFenceStatusOfService(context.TODO(), nil, req.NamespacedName)
 		} else {
 			log.Errorf("get serviceFence error,%+v", err)
 			return reconcile.Result{}, err
@@ -134,7 +136,7 @@ func (r *ServicefenceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error
 	r.recordVisitor(instance, diff)
 	if instance.Spec.Enable {
 		if r.source != nil {
-			r.source.WatchAdd(types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace})
+			r.source.InterestAdd(types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace})
 		}
 		err = r.refreshSidecar(instance)
 	}

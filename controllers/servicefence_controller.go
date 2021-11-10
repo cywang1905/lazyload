@@ -20,13 +20,12 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slime.io/slime/framework/model/metric"
 	"strings"
 	"sync"
 	"time"
 
 	"slime.io/slime/framework/model"
-
-	"slime.io/slime/framework/apis/config/v1alpha1"
 
 	istio "istio.io/api/networking/v1alpha3"
 	corev1 "k8s.io/api/core/v1"
@@ -43,9 +42,6 @@ import (
 	"slime.io/slime/framework/apis/networking/v1alpha3"
 	"slime.io/slime/framework/bootstrap"
 	"slime.io/slime/framework/controllers"
-	event_source "slime.io/slime/framework/model/source"
-	"slime.io/slime/framework/model/source/aggregate"
-	"slime.io/slime/framework/model/source/k8s"
 	"slime.io/slime/framework/util"
 
 	lazyloadv1alpha1 "slime.io/slime/modules/lazyload/api/v1alpha1"
@@ -55,43 +51,38 @@ import (
 // ServicefenceReconciler reconciles a Servicefence object
 type ServicefenceReconciler struct {
 	client.Client
-	Scheme            *runtime.Scheme
-	cfg               *v1alpha1.Fence
+	Scheme *runtime.Scheme
+	//cfg               *v1alpha1.Fence
+	//source            source.MetricSourceForModule
+	//eventChans		 []<-chan metric.UserEvent
 	env               *bootstrap.Environment
-	eventChan         chan event_source.Event
-	source            event_source.Source
+	users             []metric.User
 	reconcileLock     sync.Mutex
 	staleNamespaces   map[string]bool
 	enabledNamespaces map[string]bool
 }
 
 // NewReconciler returns a new reconcile.Reconciler
-func NewReconciler(cfg *v1alpha1.Fence, mgr manager.Manager, env *bootstrap.Environment) *ServicefenceReconciler {
-	log := modmodel.ModuleLog.WithField(model.LogFieldKeyFunction, "NewReconciler")
+func NewReconciler(us []metric.User, mgr manager.Manager, env *bootstrap.Environment) *ServicefenceReconciler {
+	//log := modmodel.ModuleLog.WithField(model.LogFieldKeyFunction, "NewReconciler")
 
 	r := &ServicefenceReconciler{
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
-		cfg:               cfg,
 		env:               env,
+		users:             us,
 		staleNamespaces:   map[string]bool{},
 		enabledNamespaces: map[string]bool{},
 	}
 
-	if env.Config.Metric != nil {
-		eventChan := make(chan event_source.Event)
-		src := &aggregate.Source{}
-		if ms, err := k8s.NewMetricSource(eventChan, env); err != nil {
-			log.Errorf("failed to create slime-metric, %+v", err)
-		} else {
-			src.Sources = append(src.Sources, ms)
-			r.eventChan = eventChan
-			r.source = src
+	//for _, u := range us {
+	//	r.users = append(r.users, u)
+	//}
 
-			r.source.Start(env.Stop)
-			r.WatchSource(env.Stop)
-		}
+	if env.Config.Metric != nil {
+		r.WatchSource()
 	}
+
 	return r
 }
 
@@ -114,8 +105,12 @@ func (r *ServicefenceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error
 		if errors.IsNotFound(err) {
 			// TODO should be recovered? maybe we should call refreshFenceStatusOfService here
 			log.Info("serviceFence is deleted")
-			r.source.WatchRemove(req.NamespacedName)
-			return reconcile.Result{}, nil
+			for _, user := range r.users {
+				if err = user.RemoveInterestMeta(req.NamespacedName); err != nil {
+					log.Errorf("user %s remove interest meta error: %v", user.GetName(), err)
+				}
+			}
+			return r.refreshFenceStatusOfService(context.TODO(), nil, req.NamespacedName)
 		} else {
 			log.Errorf("get serviceFence error,%+v", err)
 			return reconcile.Result{}, err
@@ -127,14 +122,16 @@ func (r *ServicefenceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error
 			req.NamespacedName, rev, r.env.IstioRev())
 		return reconcile.Result{}, nil
 	}
-	log.Infof("get serviceFence, %+v", req.NamespacedName)
+	log.Infof("ServicefenceReconciler got serviceFence request, %+v", req.NamespacedName)
 
 	// 资源更新
 	diff := r.updateVisitedHostStatus(instance)
 	r.recordVisitor(instance, diff)
 	if instance.Spec.Enable {
-		if r.source != nil {
-			r.source.WatchAdd(types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace})
+		for _, user := range r.users {
+			if err = user.AddInterestMeta(req.NamespacedName); err != nil {
+				log.Errorf("user %s remove interest meta error: %v", user.GetName(), err)
+			}
 		}
 		err = r.refreshSidecar(instance)
 	}
@@ -143,6 +140,7 @@ func (r *ServicefenceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error
 }
 
 func (r *ServicefenceReconciler) refreshSidecar(instance *lazyloadv1alpha1.ServiceFence) error {
+	log := log.WithField("reporter", "ServicefenceReconciler").WithField("function", "refreshSidecar")
 	sidecar, err := newSidecar(instance, r.env)
 	if err != nil {
 		log.Errorf("servicefence generate sidecar failed, %+v", err)
@@ -184,7 +182,7 @@ func (r *ServicefenceReconciler) refreshSidecar(instance *lazyloadv1alpha1.Servi
 			nsName, rev, sfRev)
 	} else {
 		if !reflect.DeepEqual(found.Spec, sidecar.Spec) {
-			log.Infof("Update a Sidecarin %s:%s", sidecar.Namespace, sidecar.Name)
+			log.Infof("Update a Sidecar in %s:%s", sidecar.Namespace, sidecar.Name)
 			sidecar.ResourceVersion = found.ResourceVersion
 			err = r.Client.Update(context.TODO(), sidecar)
 			if err != nil {

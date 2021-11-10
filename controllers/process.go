@@ -2,19 +2,17 @@ package controllers
 
 import (
 	"context"
-	"fmt"
-
+	prometheusModel "github.com/prometheus/common/model"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"slime.io/slime/framework/model"
+	"slime.io/slime/framework/model/metric"
 
-	"k8s.io/apimachinery/pkg/api/errors"
-
-	event_source "slime.io/slime/framework/model/source"
 	lazyloadv1alpha1 "slime.io/slime/modules/lazyload/api/v1alpha1"
 )
 
@@ -27,25 +25,42 @@ const (
 	CreatedByFenceController = "fence-controller"
 )
 
-func (r *ServicefenceReconciler) WatchSource(stop <-chan struct{}) {
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case e := <-r.eventChan:
-				switch e.EventType {
-				case event_source.Update, event_source.Add:
-					if _, err := r.Refresh(reconcile.Request{NamespacedName: e.Loc}, e.Info); err != nil {
-						fmt.Printf("error:%v", err)
-					}
+func (r *ServicefenceReconciler) WatchSource() {
+	log := log.WithField("reporter", "ServicefenceReconciler").WithField("function", "WatchSource")
+	log.Infof("start WatchSource")
+	for _, user := range r.users {
+		go func(u metric.User) {
+			for {
+				ue, ok := <-u.GetUserEventChan()
+				if !ok {
+					log.Warningf("[ServicefenceReconciler] user event channel closed, break process loop")
+					return
 				}
+				nn, ok := ue.Meta.(types.NamespacedName)
+				if !ok {
+					log.Errorf("got user event with wrong Meta type")
+					continue
+				}
+				material, ok := ue.Material.(map[string]prometheusModel.Value)
+				if !ok {
+					log.Errorf("got user event with wrong Material type")
+					continue
+				}
+				log.Debugf("got user event %s", nn.String())
+				if _, err := r.Refresh(reconcile.Request{NamespacedName: nn}, material); err != nil {
+					log.Errorf("refresh error:%v", err)
+				}
+
 			}
-		}
-	}()
+		}(user)
+
+	}
 }
 
-func (r *ServicefenceReconciler) Refresh(req reconcile.Request, args map[string]string) (reconcile.Result, error) {
+func (r *ServicefenceReconciler) Refresh(req reconcile.Request, material map[string]prometheusModel.Value) (reconcile.Result, error) {
+	log := log.WithField("reporter", "ServicefenceReconciler").WithField("function", "Refresh")
+	fenceMaterial := r.convertMaterial(material)
+
 	sf := &lazyloadv1alpha1.ServiceFence{}
 	err := r.Client.Get(context.TODO(), req.NamespacedName, sf)
 
@@ -75,13 +90,27 @@ func (r *ServicefenceReconciler) Refresh(req reconcile.Request, args map[string]
 		}
 	}
 
-	sf.Status.MetricStatus = args
+	sf.Status.MetricStatus = fenceMaterial
 	err = r.Client.Status().Update(context.TODO(), sf)
 	if err != nil {
 		log.Errorf("can not update ServiceFence %s, %+v", req.NamespacedName.Name, err)
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+func (r *ServicefenceReconciler) convertMaterial(material map[string]prometheusModel.Value) map[string]string {
+	result := make(map[string]string)
+	for _, qv := range material {
+		switch qv.Type() {
+		case prometheusModel.ValVector:
+			vector := qv.(prometheusModel.Vector)
+			for _, vx := range vector {
+				result[vx.Metric.String()] = vx.Value.String()
+			}
+		}
+	}
+	return result
 }
 
 func (r *ServicefenceReconciler) isServiceFenced(ctx context.Context, svc *corev1.Service) bool {
